@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# shooter_instant.sh
+# Super responsive terminal shooter with multi-character enemies and instant controls
+
+set +o errexit
+set +o nounset
+
+ERROR_LOG="$HOME/bash_shooter_error.log"
+LAST_CMD="startup"
+
+on_error() {
+  local exit_status=$?
+  local lineno=${1:-$LINENO}
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  {
+    printf "=== ERROR at %s ===\n" "$ts"
+    printf "Exit status: %d\n" "$exit_status"
+    printf "Line: %s\n" "$lineno"
+    printf "Last known good command: %s\n" "$LAST_CMD"
+    printf "\n"
+  } >> "$ERROR_LOG"
+  cleanup
+  exit "$exit_status"
+}
+trap 'on_error $LINENO' ERR
+trap 'on_error $LINENO' SIGTERM
+
+cleanup() {
+  tput cnorm 2>/dev/null || true
+  [[ -n "$OLD_STTY" ]] && stty "$OLD_STTY" 2>/dev/null || true
+  clear
+}
+trap cleanup EXIT
+
+OLD_STTY=$(stty -g 2>/dev/null || true)
+stty -echo -icanon time 0 min 0 2>/dev/null || true
+tput civis 2>/dev/null || true
+
+PLAYER_CHAR=">"
+BULLET_CHAR="-"
+WALL_CHAR="#"
+LIVES=3
+DIFFICULTY="Medium"
+SCORE=0
+HIGHSCORE_FILE="$HOME/.bash_shooter_highscore"
+[[ -f "$HIGHSCORE_FILE" ]] || echo 0 > "$HIGHSCORE_FILE"
+HIGHSCORE=$(cat "$HIGHSCORE_FILE" 2>/dev/null || echo 0)
+
+# === ENEMIES ===
+declare -A ENEMY_CHAR=(
+  [1]="{=}"
+  [2]="[=]"
+  [3]="BOOB"
+  [4]="(=)"
+  [5]="<=>"
+)
+declare -A ENEMY_PATTERN=(
+  [1]="straight"
+  [2]="zigzag"
+  [3]="swoop"
+  [4]="wave"
+  [5]="dash"
+)
+declare -A ENEMY_POINTS=(
+  [1]=10 [2]=10 [3]=30 [4]=20 [5]=25
+)
+ENEMY_COUNT=5
+
+# === DIFFICULTY FRAME SPEED ===
+declare -A FPS_MAP=( ["Easy"]=20 ["Medium"]=40 ["Hard"]=60 )
+
+get_size() {
+  WIDTH=$(tput cols 2>/dev/null || echo 80)
+  HEIGHT=$(tput lines 2>/dev/null || echo 24)
+  ((GAME_H = HEIGHT - 3))
+  ((GAME_W = WIDTH - 2))
+  ((GAME_H < 5)) && GAME_H=5
+  ((GAME_W < 10)) && GAME_W=10
+}
+
+draw_border() {
+  clear
+  for ((i=0;i<WIDTH;i++)); do printf "%s" "$WALL_CHAR"; done
+  printf "\n"
+  for ((r=0;r<GAME_H;r++)); do
+    printf "%s" "$WALL_CHAR"
+    printf "%-${GAME_W}s" ""
+    printf "%s\n" "$WALL_CHAR"
+  done
+  for ((i=0;i<WIDTH;i++)); do printf "%s" "$WALL_CHAR"; done
+  printf "\n"
+  printf "Lives:%d | Score:%d | High:%d | Diff:%s\n" \
+    "$LIVES" "$SCORE" "$HIGHSCORE" "$DIFFICULTY"
+}
+
+put_str() {
+  local r=$1 c=$2 text="$3"
+  tput cup $((r+1)) $((c+1)) 2>/dev/null || true
+  printf "%s" "$text"
+}
+
+# ultra-fast non-blocking input
+read_key() {
+  KEY=""
+  IFS= read -rsn1 -t 0.001 key 2>/dev/null || true
+  if [[ $key == $'\e' ]]; then
+    IFS= read -rsn2 -t 0.001 rest 2>/dev/null || true
+    key+="$rest"
+  fi
+  KEY="$key"
+}
+
+spawn_enemy_seq() {
+  local row=$((RANDOM % GAME_H))
+  local etype_index=$(( (SPAWN_SEQ % ENEMY_COUNT) + 1 ))
+  enemies+=("$row:$((GAME_W-6)):$etype_index:0")
+  ((SPAWN_SEQ++))
+}
+
+game_over_flash() {
+  get_size
+  for i in {1..4}; do
+    clear
+    if (( i % 2 == 1 )); then
+      tput cup $((HEIGHT/2)) $((WIDTH/2-6)) 2>/dev/null || true
+      printf "GAME OVER!!!"
+    fi
+    sleep 0.35
+  done
+  clear
+  printf "Final Score: %d\n" "$SCORE"
+  printf "High Score : %d\n" "$HIGHSCORE"
+  if (( SCORE > HIGHSCORE )); then
+    printf "New High Score! Save it? (y/n): "
+    stty "$OLD_STTY" 2>/dev/null || true
+    read -rn1 ans 2>/dev/null || ans="n"
+    stty -echo -icanon time 0 min 0 2>/dev/null || true
+    [[ "$ans" =~ [yY] ]] && echo "$SCORE" > "$HIGHSCORE_FILE"
+  else
+    printf "Press any key to return..."
+    stty "$OLD_STTY" 2>/dev/null || true
+    read -rn1 2>/dev/null || true
+    stty -echo -icanon time 0 min 0 2>/dev/null || true
+  fi
+}
+
+run_game() {
+  get_size
+  player_r=$((GAME_H/2))
+  player_c=3
+  bullets=()
+  enemies=()
+  SCORE=0
+  LIVES=3
+  tick=0
+  SPAWN_SEQ=0
+
+  fps=${FPS_MAP[$DIFFICULTY]:-30}
+  frame_delay=$(awk "BEGIN {print 1/$fps}")
+  spawn_rate=25
+
+  draw_border
+  put_str "$player_r" "$player_c" "$PLAYER_CHAR"
+
+  while ((LIVES > 0)); do
+    ((tick++))
+    read_key
+    case "$KEY" in
+      $'\e[A'|w|W) ((player_r--));;
+      $'\e[B'|s|S) ((player_r++));;
+      $'\e[D'|a|A) ((player_c--));;
+      $'\e[C'|d|D) ((player_c++));;
+      ' ') bullets+=("$player_r:$((player_c+1))");;
+      q|Q) break;;
+    esac
+
+    ((player_r<0)) && player_r=0
+    ((player_r>=GAME_H)) && player_r=$((GAME_H-1))
+    ((player_c<1)) && player_c=1
+    ((player_c>=GAME_W-1)) && player_c=$((GAME_W-2))
+
+    ((tick % 100 == 0)) && ((spawn_rate = spawn_rate > 5 ? spawn_rate-1 : 5))
+    ((tick % spawn_rate == 0)) && spawn_enemy_seq
+
+    new_bullets=()
+    for b in "${bullets[@]}"; do
+      IFS=':' read -r br bc <<<"$b"
+      ((bc++))
+      ((bc<GAME_W-1)) && new_bullets+=("$br:$bc")
+    done
+    bullets=("${new_bullets[@]}")
+
+    new_enemies=()
+    for e in "${enemies[@]}"; do
+      IFS=':' read -r er ec etype age <<<"$e"
+      pattern="${ENEMY_PATTERN[$etype]}"
+      case "$pattern" in
+        straight) ((ec--));;
+        zigzag) ((ec--)); ((er += age%2==0 ? 1 : -1));;
+        swoop) ((ec--)); ((age%3==0)) && ((er += (er<player_r) ? 1 : (er>player_r ? -1 : 0)));;
+        wave) ((ec--)); ((er += (tick%4<2) ? 1 : -1));;
+        dash) ((ec-=2));;
+      esac
+      ((age++))
+      ((er==player_r && ec<=player_c && ec>=player_c-3)) && ((LIVES--)) && continue
+      ((ec>0)) && new_enemies+=("$er:$ec:$etype:$age")
+    done
+    enemies=("${new_enemies[@]}")
+
+    final_enemies=()
+    for e in "${enemies[@]}"; do
+      IFS=':' read -r er ec etype age <<<"$e"
+      enemy_str="${ENEMY_CHAR[$etype]}"
+      hit=0
+      new_bullets=()
+      for b in "${bullets[@]}"; do
+        IFS=':' read -r br bc <<<"$b"
+        if ((br==er && bc>=ec && bc<=ec+${#enemy_str}-1)); then
+          hit=1; ((SCORE+=${ENEMY_POINTS[$etype]}))
+        else
+          new_bullets+=("$b")
+        fi
+      done
+      bullets=("${new_bullets[@]}")
+      ((hit==0)) && final_enemies+=("$e")
+    done
+    enemies=("${final_enemies[@]}")
+
+    draw_border
+    for b in "${bullets[@]}"; do
+      IFS=':' read -r br bc <<<"$b"
+      put_str "$br" "$bc" "$BULLET_CHAR"
+    done
+    for e in "${enemies[@]}"; do
+      IFS=':' read -r er ec etype age <<<"$e"
+      put_str "$er" "$ec" "${ENEMY_CHAR[$etype]}"
+    done
+    put_str "$player_r" "$player_c" "$PLAYER_CHAR"
+
+    # faster than sleep (microseconds)
+    if command -v usleep >/dev/null 2>&1; then
+      usleep "$(awk "BEGIN {print int($frame_delay*1000000)}")"
+    else
+      sleep "$frame_delay"
+    fi
+  done
+
+  ((LIVES<=0)) && game_over_flash
+}
+
+menu() {
+  while true; do
+    get_size
+    clear
+    echo
+    echo "  === TERMINAL SHOOTER ==="
+    echo "  -------------------------"
+    echo "  1) Start Game"
+    echo "  2) Change Difficulty (current: $DIFFICULTY)"
+    echo "  3) Change Craft (current: $PLAYER_CHAR)"
+    echo "  4) Show High Score"
+    echo "  5) Quit"
+    echo
+    echo -n "  Choose option (1-5): "
+    read -rsn1 opt 2>/dev/null || opt="1"
+    case "$opt" in
+      1) run_game ;;
+      2) change_difficulty ;;
+      3) change_craft ;;
+      4) show_highscore ;;
+      5) break ;;
+    esac
+  done
+}
+
+change_difficulty() {
+  clear
+  echo "Select difficulty:"
+  echo "1) Easy"
+  echo "2) Medium"
+  echo "3) Hard"
+  read -rsn1 ch 2>/dev/null || return
+  case "$ch" in
+    1) DIFFICULTY="Easy";;
+    2) DIFFICULTY="Medium";;
+    3) DIFFICULTY="Hard";;
+  esac
+}
+
+change_craft() {
+  stty "$OLD_STTY" 2>/dev/null || true
+  echo -n "Enter new craft character: "
+  read -r -n3 newchar 2>/dev/null || newchar=""
+  echo
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+  [[ -n "$newchar" ]] && PLAYER_CHAR="$newchar"
+}
+
+show_highscore() {
+  clear
+  echo "Current High Score: $HIGHSCORE"
+  echo "Press any key to return..."
+  stty "$OLD_STTY" 2>/dev/null || true
+  read -rn1 2>/dev/null || true
+  stty -echo -icanon time 0 min 0 2>/dev/null || true
+}
+
+menu
+cleanup
+exit 0
